@@ -25,7 +25,6 @@ static int rbal_proc_nr; /* Next process after the last that have had tokens
 				balanced */
 static clock_t prev_uptime; /* To get the number of tokens at disposal */
 static clock_t sys_time, uptime; /* used when fetching sys times*/
-static int sometimes;
 
 static int schedule_process(struct schedproc * rmp, unsigned flags);
 static void balance_queues(minix_timer_t *tp);
@@ -95,13 +94,10 @@ static void pick_cpu(struct schedproc * proc)
  *				sys_time tokens				     *
  *===========================================================================*/
 
-int tokens_in_between(clock_t &end, clock_t &beg)
+int tokens_in_between(clock_t *end, clock_t *beg)
 {
 	int diff = *end - *beg;
-	if (sometimes % 1000 == 0) {
-		printf ("Tokens diff %d\n", diff);
-	}
-	return diff < 0? (int)*beg : diff;
+	return diff < 0? 0 : diff;
 }
 
 static void balance_tokens()
@@ -112,11 +108,11 @@ static void balance_tokens()
 	int was_throttled = 0;
 
 	sys_times(NONE, NULL, NULL, &uptime, NULL);
-	tokens_at_disposal = tokens_in_between(uptime, prev_uptime)
+	tokens_at_disposal = tokens_in_between(&uptime, &prev_uptime);
 	tokens_at_disposal *= SCHED_FACTOR;
 	prev_uptime = uptime;
 
-	while (tokens_at_disposal > 0 || processed < NR_PROCS) {
+	while (tokens_at_disposal > 0 && processed < NR_PROCS) {
 		rmp = schedproc + rbal_proc_nr;
 		grant = MAX_TOKENS - rmp->tokens;
 		if (grant > tokens_at_disposal) {
