@@ -19,6 +19,14 @@ static unsigned balance_timeout;
 
 #define BALANCE_TIMEOUT	5 /* how often to balance queues in seconds */
 
+#define MAX_TOKENS 6
+#define SCHED_FACTOR 0.5
+static int rbal_proc_nr; /* Next process after the last that have had tokens
+				balanced */
+static clock_t prev_uptime; /* To get the number of tokens at disposal */
+static clock_t sys_time, uptime; /* used when fetching sys times*/
+static int sometimes;
+
 static int schedule_process(struct schedproc * rmp, unsigned flags);
 static void balance_queues(minix_timer_t *tp);
 
@@ -84,13 +92,56 @@ static void pick_cpu(struct schedproc * proc)
 }
 
 /*===========================================================================*
+ *				sys_time tokens				     *
+ *===========================================================================*/
+
+int tokens_in_between(clock_t &end, clock_t &beg)
+{
+	int diff = *end - *beg;
+	if (sometimes % 1000 == 0) {
+		printf ("Tokens diff %d\n", diff);
+	}
+	return diff < 0? (int)*beg : diff;
+}
+
+static void balance_tokens()
+{
+	struct schedproc *rmp;
+	int proc_nr, grant, tokens_at_disposal;
+	int processed = 0;
+	int was_throttled = 0;
+
+	sys_times(NONE, NULL, NULL, &uptime, NULL);
+	tokens_at_disposal = tokens_in_between(uptime, prev_uptime)
+	tokens_at_disposal *= SCHED_FACTOR;
+	prev_uptime = uptime;
+
+	while (tokens_at_disposal > 0 || processed < NR_PROCS) {
+		rmp = schedproc + rbal_proc_nr;
+		grant = MAX_TOKENS - rmp->tokens;
+		if (grant > tokens_at_disposal) {
+			grant = tokens_at_disposal;
+		}
+		was_throttled = rmp->tokens < 0;
+		rmp->tokens += grant;
+		tokens_at_disposal -= grant;
+		if (was_throttled && rmp->tokens > 0) {
+			schedule_process_local(rmp);
+		}
+		++processed;
+		rbal_proc_nr = (rbal_proc_nr + 1) % NR_PROCS;
+	}
+}
+
+
+/*===========================================================================*
  *				do_noquantum				     *
  *===========================================================================*/
 
 int do_noquantum(message *m_ptr)
 {
 	register struct schedproc *rmp;
-	int rv, proc_nr_n;
+	int rv, proc_nr_n, tokens;
 
 	if (sched_isokendpt(m_ptr->m_source, &proc_nr_n) != OK) {
 		printf("SCHED: WARNING: got an invalid endpoint in OOQ msg %u.\n",
@@ -99,6 +150,17 @@ int do_noquantum(message *m_ptr)
 	}
 
 	rmp = &schedproc[proc_nr_n];
+
+	sys_times(rmp->endpoint, NULL, &sys_time, NULL, NULL);
+	tokens = tokens_in_between(&sys_time, &rmp->prev_systime);
+	rmp->prev_systime = sys_time;
+	rmp->tokens -= tokens;
+	balance_tokens();
+
+	if (rmp->tokens < 0) {
+		rmp->time_slice = -1;
+	}
+
 	if (rmp->priority < MIN_USER_Q) {
 		rmp->priority += 1; /* lower priority */
 	}
@@ -159,11 +221,14 @@ int do_start_scheduling(message *m_ptr)
 		return rv;
 	}
 	rmp = &schedproc[proc_nr_n];
+	sys_times(rmp->endpoint, NULL, &sys_time, NULL, NULL);
 
 	/* Populate process slot */
 	rmp->endpoint     = m_ptr->m_lsys_sched_scheduling_start.endpoint;
 	rmp->parent       = m_ptr->m_lsys_sched_scheduling_start.parent;
 	rmp->max_priority = m_ptr->m_lsys_sched_scheduling_start.maxprio;
+	rmp->tokens       = MAX_TOKENS;
+	rmp->prev_systime = sys_time;
 	if (rmp->max_priority >= NR_SCHED_QUEUES) {
 		return EINVAL;
 	}
@@ -338,6 +403,8 @@ void init_scheduling(void)
 	balance_timeout = BALANCE_TIMEOUT * sys_hz();
 	init_timer(&sched_timer);
 	set_timer(&sched_timer, balance_timeout, balance_queues, 0);
+	sys_times(NONE, NULL, NULL, &uptime, NULL);
+	prev_uptime = uptime;
 }
 
 /*===========================================================================*
@@ -354,6 +421,7 @@ static void balance_queues(minix_timer_t *tp)
 	struct schedproc *rmp;
 	int proc_nr;
 
+	balance_tokens();
 	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
 		if (rmp->flags & IN_USE) {
 			if (rmp->priority > rmp->max_priority) {
