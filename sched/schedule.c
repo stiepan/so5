@@ -17,14 +17,17 @@
 static minix_timer_t sched_timer;
 static unsigned balance_timeout;
 
-#define BALANCE_TIMEOUT	5 /* how often to balance queues in seconds */
+static unsigned short sometimes;
 
-#define MAX_TOKENS 6
-#define SCHED_FACTOR 0.5
-static int rbal_proc_nr; /* Next process after the last that have had tokens
+static int rbal_proc_nr; /* next process after the last that have had tokens
 				balanced */
-static clock_t prev_uptime; /* To get the number of tokens at disposal */
+static clock_t prev_uptime; /* to get the number of tokens at disposal */
 static clock_t sys_time, uptime; /* used when fetching sys times*/
+
+#define BALANCE_TIMEOUT	5 /* how often to balance queues in seconds */
+#define MAX_TOKENS 6 /* initial value and the upper bound for the
+			number of tokens single process can acquire */
+#define SCHED_FACTOR 0.5 /* used to limit overall amount of tokens */
 
 static int schedule_process(struct schedproc * rmp, unsigned flags);
 static void balance_queues(minix_timer_t *tp);
@@ -60,7 +63,7 @@ static void pick_cpu(struct schedproc * proc)
 #ifdef CONFIG_SMP
 	unsigned cpu, c;
 	unsigned cpu_load = (unsigned) -1;
-	
+
 	if (machine.processors_count == 1) {
 		proc->cpu = machine.bsp_id;
 		return;
@@ -100,12 +103,11 @@ int tokens_in_between(clock_t *end, clock_t *beg)
 	return diff < 0? 0 : diff;
 }
 
-static void balance_tokens()
+static int balance_tokens()
 {
 	struct schedproc *rmp;
 	int proc_nr, grant, tokens_at_disposal;
-	int processed = 0;
-	int was_throttled = 0;
+	int processed = 0, any_throttled = 0;
 
 	sys_times(NONE, NULL, NULL, &uptime, NULL);
 	tokens_at_disposal = tokens_in_between(&uptime, &prev_uptime);
@@ -114,18 +116,32 @@ static void balance_tokens()
 
 	while (tokens_at_disposal > 0 && processed < NR_PROCS) {
 		rmp = schedproc + rbal_proc_nr;
-		grant = MAX_TOKENS - rmp->tokens;
-		if (grant > tokens_at_disposal) {
-			grant = tokens_at_disposal;
-		}
-		was_throttled = rmp->tokens < 0;
-		rmp->tokens += grant;
-		tokens_at_disposal -= grant;
-		if (was_throttled && rmp->tokens > 0) {
-			schedule_process_local(rmp);
+		if (rmp->flags & IN_USE) {
+			grant = MAX_TOKENS - rmp->tokens;
+			if (grant > tokens_at_disposal) {
+				grant = tokens_at_disposal;
+			}
+			rmp->if_throttled = (rmp->tokens <= 0);
+			rmp->tokens += grant;
+			rmp->if_throttled &= (rmp->tokens > 0);
+			any_throttled |= rmp->if_throttled;
+			tokens_at_disposal -= grant;
 		}
 		++processed;
 		rbal_proc_nr = (rbal_proc_nr + 1) % NR_PROCS;
+	}
+	return any_throttled;
+}
+
+static void reschedule_throttled()
+{
+	struct schedproc *rmp;
+	int proc_nr;
+
+	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
+		if (rmp->flags & IN_USE && rmp->if_throttled) {
+			schedule_process_local(rmp);
+		}
 	}
 }
 
@@ -137,7 +153,7 @@ static void balance_tokens()
 int do_noquantum(message *m_ptr)
 {
 	register struct schedproc *rmp;
-	int rv, proc_nr_n, tokens;
+	int rv, proc_nr_n, tokens, any_throttled;
 
 	if (sched_isokendpt(m_ptr->m_source, &proc_nr_n) != OK) {
 		printf("SCHED: WARNING: got an invalid endpoint in OOQ msg %u.\n",
@@ -151,19 +167,25 @@ int do_noquantum(message *m_ptr)
 	tokens = tokens_in_between(&sys_time, &rmp->prev_systime);
 	rmp->prev_systime = sys_time;
 	rmp->tokens -= tokens;
-	balance_tokens();
 
-	if (rmp->tokens < 0) {
-		rmp->time_slice = -1;
-	}
+	/* Allot tokens to proceses and check if any
+	processes once run out of tokens can be rescheduled */
+	any_throttled = balance_tokens();
 
 	if (rmp->priority < MIN_USER_Q) {
 		rmp->priority += 1; /* lower priority */
 	}
 
-	if ((rv = schedule_process_local(rmp)) != OK) {
-		return rv;
+	if (any_throttled) {
+		reschedule_throttled();
 	}
+
+	if (rmp->tokens > 0) {
+		if ((rv = schedule_process_local(rmp)) != OK) {
+			return rv;
+		}
+	}
+
 	return OK;
 }
 
@@ -202,7 +224,7 @@ int do_start_scheduling(message *m_ptr)
 {
 	register struct schedproc *rmp;
 	int rv, proc_nr_n, parent_nr_n;
-	
+
 	/* we can handle two kinds of messages here */
 	assert(m_ptr->m_type == SCHEDULING_START || 
 		m_ptr->m_type == SCHEDULING_INHERIT);
@@ -225,6 +247,7 @@ int do_start_scheduling(message *m_ptr)
 	rmp->max_priority = m_ptr->m_lsys_sched_scheduling_start.maxprio;
 	rmp->tokens       = MAX_TOKENS;
 	rmp->prev_systime = sys_time;
+	rmp->if_throttled = 0;
 	if (rmp->max_priority >= NR_SCHED_QUEUES) {
 		return EINVAL;
 	}
@@ -422,7 +445,9 @@ static void balance_queues(minix_timer_t *tp)
 		if (rmp->flags & IN_USE) {
 			if (rmp->priority > rmp->max_priority) {
 				rmp->priority -= 1; /* increase priority */
-				schedule_process_local(rmp);
+				if (rmp->tokens > 0) {
+					schedule_process_local(rmp);
+				}
 			}
 		}
 	}
